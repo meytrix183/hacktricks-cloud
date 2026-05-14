@@ -18,6 +18,49 @@ MAX_TOKENS = 50000 #gpt-4-1106-preview
 DISALLOWED_SPECIAL = "<|endoftext|>"
 REPLACEMENT_TOKEN  = "<END_OF_TEXT>"
 
+TOKENIZER_FALLBACKS = [
+    ("gpt-5", "o200k_base"),
+    ("gpt-4o", "o200k_base"),
+    ("gpt-4.1", "o200k_base"),
+    ("gpt-4", "cl100k_base"),
+    ("gpt-3.5", "cl100k_base"),
+]
+
+FINAL_TOKENIZER_FALLBACK = "o200k_base"
+
+def run_git_command_with_retry(cmd, max_retries=1, delay=5, **kwargs):
+    """
+    Run a git command with retry logic.
+    
+    Args:
+        cmd: Command to run (list or string)
+        max_retries: Number of additional retries after first failure
+        delay: Delay in seconds between retries
+        **kwargs: Additional arguments to pass to subprocess.run
+    
+    Returns:
+        subprocess.CompletedProcess result
+    """
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(cmd, **kwargs)
+            return result
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                print(f"Git command failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                print(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print(f"Git command failed after {max_retries + 1} attempts: {e}")
+                
+    # If we get here, all attempts failed, re-raise the last exception
+    if last_exception:
+        raise last_exception
+    else:
+        raise RuntimeError("Unexpected error in git command retry logic")
+
 def _sanitize(text: str) -> str:
     """
     Replace the reserved tiktoken token with a harmless placeholder.
@@ -26,8 +69,24 @@ def _sanitize(text: str) -> str:
     """
     return text.replace(DISALLOWED_SPECIAL, REPLACEMENT_TOKEN)
 
+def _get_encoding_for_model(model: str):
+    """
+    Return a tokenizer for the requested model, with fallbacks for newer
+    model names that tiktoken may not recognize yet.
+    """
+    try:
+        return tiktoken.encoding_for_model(model)
+    except KeyError:
+        lowered_model = model.lower()
+        for prefix, encoding_name in TOKENIZER_FALLBACKS:
+            if lowered_model.startswith(prefix):
+                print(f"Tokenizer for model {model} not found. Falling back to {encoding_name}.")
+                return tiktoken.get_encoding(encoding_name)
+        print(f"Tokenizer for model {model} not found. Falling back to {FINAL_TOKENIZER_FALLBACK}.")
+        return tiktoken.get_encoding(FINAL_TOKENIZER_FALLBACK)
+
 def reportTokens(prompt, model):
-    encoding = tiktoken.encoding_for_model(model)
+    encoding = _get_encoding_for_model(model)
     # print number of tokens in light gray, with first 50 characters of prompt in green. if truncated, show that it is truncated
     #print("\033[37m" + str(len(encoding.encode(prompt))) + " tokens\033[0m" + " in prompt: " + "\033[92m" + prompt[:50] + "\033[0m" + ("..." if len(prompt) > 50 else ""))
     prompt   = _sanitize(prompt)
@@ -42,7 +101,7 @@ def check_git_dir(path):
 def get_branch_files(branch):
     """Get a list of all files in a branch."""
     command = f"git ls-tree -r --name-only {branch}"
-    result = subprocess.run(command.split(), stdout=subprocess.PIPE)
+    result = run_git_command_with_retry(command.split(), stdout=subprocess.PIPE)
     files = result.stdout.decode().splitlines()
     return set(files)
 
@@ -63,12 +122,12 @@ def cp_translation_to_repo_dir_and_check_gh_branch(branch, temp_folder, translat
     Get the translated files from the temp folder and copy them to the repo directory in the expected branch.
     Also remove all the files that are not in the master branch.
     """
-    branch_exists = subprocess.run(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch])
+    branch_exists = run_git_command_with_retry(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch])
     # If branch doesn't exist, create it
     if branch_exists.returncode != 0:
-        subprocess.run(['git', 'checkout', '-b', branch])
+        run_git_command_with_retry(['git', 'checkout', '-b', branch])
     else:
-        subprocess.run(['git', 'checkout', branch])
+        run_git_command_with_retry(['git', 'checkout', branch])
 
     # Get files to delete
     files_to_delete = get_unused_files(branch)
@@ -108,7 +167,7 @@ def commit_and_push(translate_files, branch):
     ]
 
     for cmd in commands:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = run_git_command_with_retry(cmd, capture_output=True, text=True)
         
         # Print stdout and stderr (if any)
         if result.stdout:
@@ -283,6 +342,7 @@ def copy_dirs(source_path, dest_path, folder_names):
             print(f"Error: {source_folder} does not exist.")
         else:
             # Copy the theme folder
+            os.makedirs(os.path.dirname(destination_folder.rstrip(os.sep)) or dest_path, exist_ok=True)
             shutil.copytree(source_folder, destination_folder)
             print(f"Copied {folder_name} folder from {source_folder} to {destination_folder}")
 
@@ -293,6 +353,7 @@ def move_files_to_push(source_path, dest_path, relative_file_paths):
         if not os.path.exists(source_filepath):
             print(f"Error: {source_filepath} does not exist.")
         else:
+            os.makedirs(os.path.dirname(dest_filepath), exist_ok=True)
             shutil.copy2(source_filepath, dest_filepath)
             print(f"[+] Copied {file_path}")
 
@@ -371,7 +432,7 @@ if __name__ == "__main__":
     parser.add_argument('-l', '--language', required=True, help='Target language for translation.')
     parser.add_argument('-b', '--branch', required=True, help='Branch name to copy translated files.')
     parser.add_argument('-k', '--api-key', required=True, help='API key to use.')
-    parser.add_argument('-m', '--model', default="gpt-5-mini", help='The openai model to use. By default: gpt-5-mini')
+    parser.add_argument('-m', '--model', default="gpt-5.4-mini", help='The openai model to use. By default: gpt-5.4-mini')
     parser.add_argument('-o', '--org-id', help='The org ID to use (if not set the default one will be used).')
     parser.add_argument('-f', '--file-paths', help='If this is set, only the indicated files will be translated (" , " separated).')
     parser.add_argument('-n', '--dont-cd', action='store_false', help="If this is true, the script won't change the current directory.")
